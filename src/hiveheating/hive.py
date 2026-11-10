@@ -72,9 +72,10 @@ class Hive:
 
     Create one per account and call :meth:`new_session` with the saved
     tokens and device credentials. Then :meth:`get_nodes` fetches Hive's
-    ``GET /nodes/all``, and the ``set_*`` commands each send one
-    ``POST /nodes/{type}/{id}``. The session keeps no device state and has no
-    timer: the caller decides when to poll.
+    ``GET /nodes/all``, and the ``set_*`` commands each send a
+    ``POST /nodes/{type}/{id}``, repeated after a transient failure. The
+    session keeps no device state and has no timer: the caller decides when
+    to poll.
 
     Every error raised is a :class:`~hiveheating.exceptions.HiveError`:
     :class:`~hiveheating.exceptions.HiveReauthRequired` when the user has to
@@ -277,7 +278,11 @@ class Hive:
         await self._set_state(product, mode="BOOST", boost=minutes)
 
     async def _set_state(self, product: Product, **state: JsonValue) -> None:
-        """Post a product's new state to Hive. Nothing is sent in file mode."""
+        """Post a product's new state to Hive. Nothing is sent in file mode.
+
+        The body sets absolute values, so sending it twice is safe and a
+        transient failure is retried.
+        """
         if self._file:
             return
         _LOGGER.debug("Setting %s %s: %s", product.type, product.id, state)

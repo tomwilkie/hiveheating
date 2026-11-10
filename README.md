@@ -159,7 +159,10 @@ caller should do about it. aiohttp and botocore exceptions never escape the libr
 | `HiveInvalidUsername`, `HiveInvalidPassword`, `HiveInvalid2FACode` | Subclasses of `HiveReauthRequired` raised by the login flow | Show the user a form error |
 
 `get_nodes()` and the commands raise on every failure and keep nothing between
-calls; retrying is up to the caller.
+calls. A command is retried inside the library after a timeout, a network
+error, an HTTP 5xx or a single HTTP 404, for up to 30 seconds, because each one
+sets absolute values and is safe to send twice. Hive's temporary block of a
+burst of requests is not retried. Retrying a failed poll is up to the caller.
 
 ---
 

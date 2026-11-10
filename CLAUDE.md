@@ -150,8 +150,8 @@ happened. Everything raised is a subclass of `HiveError` (`exceptions.py`):
 The rules that keep it consistent:
 
 - **Translate third-party errors once, at the boundary.** Every botocore error
-  is handled in `HiveAuth._cognito()` and every aiohttp error in `api._fetch()`
-  / `api.request()`. Nothing above those two functions imports or catches
+  is handled in `HiveAuth._cognito()` and every aiohttp error in `api._send()`
+  / `api.request()`. Nothing above those functions imports or catches
   aiohttp or botocore exceptions, and no `HiveError` is ever re-wrapped as
   another `HiveError`. Chain the original with `raise ... from err`.
 - **Handle or raise, never both.** Do not log an exception and re-raise it.
@@ -161,16 +161,28 @@ The rules that keep it consistent:
   `RuntimeError` and friends are never caught or converted; a traceback is the
   right outcome for a bug. Hive's data is not a programming error: parsing
   never raises (see "Parse JSON in one place").
-- **Retry only a rejected token.** There is no retry helper and no polling
-  timer: `get_nodes()` and the commands raise and the fork's coordinator
-  decides when to try again. The one retry is a single re-login through
-  `Hive._api_call()` after Hive rejects the token. "Reauth required" is raised only when
+- **Retry only a rejected token and transient write failures.** There is no
+  polling timer: `get_nodes()` raises and the fork's coordinator decides when
+  to poll again. There are two retries. One is a single re-login through
+  `Hive._api_call()` after Hive rejects the token. The other is
+  `api._fetch_with_retry()`, which `api.request()` uses for every POST (each
+  one sets a node's state to absolute values, so it is safe to send twice):
+  it retries a timeout, a network error or an HTTP 5xx, and an HTTP 404 once,
+  because Hive has answered a write to a node that exists with a 404 after a
+  10-second stall (#28). It makes at most `_MAX_ATTEMPTS` attempts with a
+  random pause of `_RETRY_DELAY` between them, starts none within
+  `_MIN_ATTEMPT_TIME` of the `_RETRY_DEADLINE` (30 s from the first send) and
+  cuts each attempt's timeout to that deadline. It never retries Hive's
+  gateway block (HTTP 403 `ForbiddenException`): it lasts a minute or two and
+  every retry adds to the burst. A GET (the poll) is sent once, and the
+  login, refresh and other Cognito calls are not retried here. "Reauth required" is raised only when
   Hive or Cognito actually rejected the credentials or asked for an SMS code,
   never as a relabelling of some other failure, and it is never retried: a
   failed login is remembered so that polls and commands do not send an SMS
   code or try a wrong password on every refresh.
 - **Timeouts are bounded and explicit.** Every Hive HTTP call has a 20 s total
-  and 10 s connect budget (`api._TIMEOUT`); Cognito calls get botocore's
+  and 10 s connect budget (`api._TIMEOUT`), and a command's retries end within
+  30 s (`api._RETRY_DEADLINE`); Cognito calls get botocore's
   `standard` retry mode with a single retry and 10 s connect / 20 s read
   timeouts (`auth._COGNITO_CONFIG`) instead of its 60 s defaults and five
   attempts. Home Assistant does the rest of the retrying: setup backoff after
@@ -272,7 +284,8 @@ test, and in review.
 - **Test at the layer that owns the logic.** `Hive._request`, `_set_state`,
   the `set_*` commands and `get_nodes` are thin delegations; each command's
   body is pinned once in `TestCommands`. Their error propagation is pinned
-  once, where the handling lives: aiohttp translation in `TestFetch`, botocore translation in `TestCognito`, login-and-retry in
+  once, where the handling lives: aiohttp translation in `TestFetch`, the
+  retry of writes in `TestRetry`, botocore translation in `TestCognito`, login-and-retry in
   `TestApiCall`, value parsing in `test_nodes.py`. A wrapper gets one test
   that it calls through, not a copy of the wrapped class's error table. The
   same goes for cross-layer repeats: `tests/e2e` exists for what only a real
@@ -317,8 +330,8 @@ src/hiveheating/
 ├── auth.py             ← HiveAuth (exported as Auth) — Cognito SRP login, SMS 2FA,
 │                         token refresh, trusted devices, LoginResult; _ensure_client()
 │                         reads the SSO login page; _cognito() translates botocore errors
-├── api.py              ← request() — HTTP calls to beekeeper.hivehome.com; _fetch()
-│                         translates aiohttp errors
+├── api.py              ← request() — HTTP calls to beekeeper.hivehome.com; _send()
+│                         translates aiohttp errors; _fetch_with_retry() retries POSTs
 ├── nodes.py            ← Nodes, User, HeatingProduct, HotWaterProduct, Device, Mode and parse_nodes()
 ├── srp.py              ← pure SRP/HKDF crypto: functions, constants and the client ephemeral
 ├── exceptions.py       ← the HiveError hierarchy
@@ -353,7 +366,8 @@ call through `api.request()` with the session's token.
   returns `parse_nodes()` of the body. Discovery and polling are the same
   call. `set_mode`, `set_target_temperature`, `set_heating_boost` and
   `set_hot_water_boost` each post a fixed body for the product they are given
-  through `_set_state()`, a no-op in file mode. There is no boost-off call:
+  through `_set_state()`, a no-op in file mode; a transient failure is retried
+  (see "Error handling"). There is no boost-off call:
   ending a boost is `set_mode` with the product's `previous_mode`.
 
 ### Nodes (`nodes.py`)

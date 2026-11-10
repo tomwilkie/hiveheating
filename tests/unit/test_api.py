@@ -341,3 +341,93 @@ class TestRequest:
             await request(websession, "get", _PATH, token=_TOKEN)
 
         assert f"HTTP 503 calling {_URL}: <html>not json</html>" in str(exc_info.value)
+
+
+# Tests for the retry of requests that are safe to repeat
+
+
+def _outcome(outcome):
+    """Return a response for an HTTP status, or the error to raise."""
+    if isinstance(outcome, int):
+        return _make_response(outcome, "{}")
+    if outcome == "forbidden":
+        return _make_response(403, "{}", {"x-amzn-ErrorType": "ForbiddenException"})
+    return outcome
+
+
+class TestRetry:
+    @pytest.fixture(autouse=True)
+    def no_sleep(self, monkeypatch):
+        sleep = AsyncMock()
+        monkeypatch.setattr("hiveheating.api.asyncio.sleep", sleep)
+        return sleep
+
+    @pytest.mark.parametrize(
+        ("outcomes", "method", "raised", "sent"),
+        [
+            pytest.param([503, 200], "post", None, 2, id="5xx-then-ok"),
+            pytest.param([TimeoutError(), 200], "post", None, 2, id="timeout-then-ok"),
+            pytest.param(
+                [aiohttp.ClientConnectionError(), 200],
+                "post",
+                None,
+                2,
+                id="connection-error-then-ok",
+            ),
+            # Hive has answered a write to a node that exists with a 404
+            # after a 10-second stall (hiveheating#28).
+            pytest.param([404, 200], "post", None, 2, id="404-then-ok"),
+            pytest.param([404, 404], "post", HiveApiError, 2, id="404-retried-once"),
+            pytest.param(
+                [404, 500, 404], "post", HiveApiError, 3, id="404-retried-once-overall"
+            ),
+            pytest.param(
+                [500, 500, 500, 200],
+                "post",
+                HiveConnectionError,
+                3,
+                id="gives-up-after-max-attempts",
+            ),
+            # The gateway block lasts minutes; retrying adds to the burst.
+            pytest.param(
+                ["forbidden", 200], "post", HiveConnectionError, 1, id="403-block"
+            ),
+            pytest.param([401, 200], "post", HiveReauthRequired, 1, id="401"),
+            pytest.param([400, 200], "post", HiveApiError, 1, id="400"),
+            # A GET (the poll) is not retried: the caller polls again on its
+            # interval.
+            pytest.param([503, 200], "get", HiveConnectionError, 1, id="get"),
+        ],
+    )
+    async def test_which_failures_are_retried(self, outcomes, method, raised, sent):
+        websession = MagicMock()
+        websession.request.side_effect = [_outcome(o) for o in outcomes]
+
+        call = request(websession, method, _PATH, token=_TOKEN)
+        if raised:
+            with pytest.raises(raised):
+                await call
+        else:
+            assert await call == {}
+        assert websession.request.call_count == sent
+
+    async def test_waits_a_random_pause_between_attempts(self, no_sleep):
+        websession = MagicMock()
+        websession.request.side_effect = [_outcome(500), _outcome(200)]
+
+        await request(websession, "post", _PATH, token=_TOKEN)
+
+        (delay,) = no_sleep.await_args.args
+        assert 0.5 <= delay <= 1.5
+
+    async def test_no_retry_starts_too_close_to_the_deadline(self, monkeypatch):
+        monkeypatch.setattr("hiveheating.api._RETRY_DEADLINE", 2.0)
+        websession = MagicMock()
+        websession.request.side_effect = [_outcome(500), _outcome(200)]
+
+        with pytest.raises(HiveConnectionError):
+            await request(websession, "post", _PATH, token=_TOKEN)
+
+        assert websession.request.call_count == 1
+        # The one attempt is held to the deadline, not the full 20 seconds.
+        assert websession.request.call_args.kwargs["timeout"].total <= 2.0

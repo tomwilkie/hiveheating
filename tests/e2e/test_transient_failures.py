@@ -21,7 +21,7 @@ from aiohttp import ClientSession, ClientTimeout, web
 from aiohttp.test_utils import TestServer
 
 from hiveheating import Hive, LoginResult
-from hiveheating.exceptions import HiveConnectionError
+from hiveheating.exceptions import HiveApiError, HiveConnectionError
 from hiveheating.nodes import parse_nodes
 
 _DATA = json.loads(
@@ -129,6 +129,7 @@ async def fake_hive(monkeypatch):
     base = str(server.server.make_url("/1.0"))
     monkeypatch.setattr("hiveheating.api._BASE_URL", base)
     monkeypatch.setattr("hiveheating.api._TIMEOUT", _TEST_TIMEOUT)
+    monkeypatch.setattr("hiveheating.api._RETRY_DELAY", (0, 0))
     yield server
     await server.close()
 
@@ -224,11 +225,13 @@ class TestDroppedConnection:
         assert _temperature(await session.get_nodes()) == 21.5
         assert fake_hive.polls == 2
 
-    async def test_a_command_is_not_resent(self, session, fake_hive):
+    async def test_the_library_resends_the_command_and_it_succeeds(
+        self, session, fake_hive
+    ):
+        # aiohttp does not resend a POST; the library's retry does.
         fake_hive.command_outcomes = ["disconnect"]
-        with pytest.raises(HiveConnectionError):
-            await session.set_target_temperature(_PRODUCTS[_HEATING_ID], 21.0)
-        assert fake_hive.commands == [{"target": 21.0}]
+        await session.set_target_temperature(_PRODUCTS[_HEATING_ID], 21.0)
+        assert fake_hive.commands == [{"target": 21.0}, {"target": 21.0}]
 
 
 class TestCommandFailures:
@@ -239,7 +242,8 @@ class TestCommandFailures:
         self, session, fake_hive, fault
     ):
         # The fork turns any HiveError from a command into HomeAssistantError.
-        fake_hive.command_outcomes = list(fault)
+        # The fault repeats for every attempt the library makes.
+        fake_hive.command_outcomes = list(fault) * 3
         with pytest.raises(HiveConnectionError):
             await session.set_target_temperature(_PRODUCTS[_HEATING_ID], 21.0)
         assert fake_hive.polls == 0
@@ -256,6 +260,19 @@ class TestCommandFailures:
             await session.set_mode(_PRODUCTS[_HOTWATER_ID], "MANUAL")
         assert fake_hive.commands == [{"mode": "MANUAL"}]
         session._login.assert_not_awaited()
+
+    async def test_a_stalled_404_is_resent_once(self, session, fake_hive):
+        # hiveheating#28: Hive answered a write to a node that exists with a
+        # 404 after a 10-second stall, and the same write worked later.
+        fake_hive.command_outcomes = [404]
+        await session.set_mode(_PRODUCTS[_HEATING_ID], "MANUAL")
+        assert fake_hive.commands == [{"mode": "MANUAL"}, {"mode": "MANUAL"}]
+
+        fake_hive.commands.clear()
+        fake_hive.command_outcomes = [404, 404]
+        with pytest.raises(HiveApiError, match="HTTP 404"):
+            await session.set_mode(_PRODUCTS[_HEATING_ID], "MANUAL")
+        assert fake_hive.commands == [{"mode": "MANUAL"}, {"mode": "MANUAL"}]
 
     async def test_a_rejected_token_logs_in_once_and_resends(self, session, fake_hive):
         fake_hive.command_outcomes = ["unauthorized"]
